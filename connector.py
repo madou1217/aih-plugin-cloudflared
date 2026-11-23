@@ -6,6 +6,7 @@ State lives under $HOME/.ai_home/plugin-state/network.cloudflared/.
 No version gate: the binary version is reported, never enforced.
 """
 import json
+import re
 import os
 import shutil
 import signal
@@ -15,7 +16,7 @@ import time
 from pathlib import Path
 
 PLUGIN_ID = "network.cloudflared"
-PLUGIN_VERSION = "0.1.3"
+PLUGIN_VERSION = "0.1.4"
 STATE_DIR = Path(os.environ.get("AIH_PLUGIN_STATE_DIR", Path.home() / ".ai_home" / "plugin-state" / PLUGIN_ID))
 STATE_FILE = STATE_DIR / "state.json"
 PID_FILE = STATE_DIR / "cloudflared.pid"
@@ -146,10 +147,13 @@ def status_view(state=None):
         label = "已停止"
     version = binary_version(binary)
     message = ""
+    public_url = str(state.get("publicUrl") or "").strip()
     if not installed:
         message = "未找到 cloudflared，可执行 install 通过 Homebrew 安装"
+    elif running and public_url:
+        message = "公网地址：" + public_url
     elif not state.get("config"):
-        message = "尚未配置 Tunnel Token 或配置文件"
+        message = "尚未配置 Tunnel Token、配置文件或 Quick Tunnel"
     return {
         "installed": installed,
         "enabled": bool(state.get("enabled")),
@@ -185,7 +189,8 @@ def describe():
                         "tunnelToken": {"type": "string", "description": "Cloudflare Tunnel Token"},
                         "credentialsFile": {"type": "string", "description": "credentials JSON 路径"},
                         "hostname": {"type": "string"},
-                        "serviceUrl": {"type": "string"},
+                        "serviceUrl": {"type": "string", "description": "Quick Tunnel 回源地址，默认 http://127.0.0.1:9527"},
+                        "quickTunnel": {"type": "string", "description": "填 true 使用免账号 Quick Tunnel"},
                         "proxyUrl": {"type": "string", "description": "安装/连接使用的 HTTP(S) 或 SOCKS 代理"},
                     },
                 },
@@ -201,7 +206,7 @@ def configure(state, value):
     if isinstance(value, dict):
         if isinstance(value.get("value"), str):
             config["tunnelToken"] = value["value"].strip()
-        for key in ("tunnelToken", "credentialsFile", "hostname", "serviceUrl", "proxyUrl"):
+        for key in ("tunnelToken", "credentialsFile", "hostname", "serviceUrl", "quickTunnel", "proxyUrl"):
             if isinstance(value.get(key), str):
                 config[key] = value[key].strip()
     elif isinstance(value, str):
@@ -246,26 +251,34 @@ def uninstall(state):
 
 
 def enable(state):
-    if not binary_path():
+    binary = binary_path()
+    if not binary:
         return {"ok": False, "changed": False, "message": "cloudflared 尚未安装", "status": status_view(state)}
     if tunnel_running():
         state["enabled"] = True
         save_state(state)
         return {"ok": True, "changed": False, "message": "隧道已在运行", "status": status_view(state)}
     config = state.get("config") or {}
+    quick = str(config.get("quickTunnel") or "").strip().lower() in ("1", "true", "yes", "on")
     token = str(config.get("tunnelToken") or "").strip()
     credentials = str(config.get("credentialsFile") or "").strip()
-    if not token and not credentials:
-        return {"ok": False, "changed": False, "message": "请先配置 Tunnel Token 或 credentialsFile", "status": status_view(state)}
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(STATE_DIR, 0o700)
-    args = [binary_path(), "tunnel", "--no-autoupdate", "run"]
+    if quick:
+        service = str(config.get("serviceUrl") or "http://127.0.0.1:9527").strip()
+        if not (service.startswith("http://") or service.startswith("https://")):
+            return {"ok": False, "changed": False, "message": "Quick Tunnel 需要有效的 serviceUrl", "status": status_view(state)}
+        args = [binary, "tunnel", "--no-autoupdate", "--url", service]
+    else:
+        if not token and not credentials:
+            return {"ok": False, "changed": False, "message": "请先配置 Tunnel Token、credentialsFile，或把 quickTunnel 设为 true", "status": status_view(state)}
+        args = [binary, "tunnel", "--no-autoupdate", "run"]
     env = proxy_env(state)
     if token:
         env["TUNNEL_TOKEN"] = token
-    elif credentials:
+    elif credentials and not quick:
         args += ["--config", credentials]
-    log_handle = open(LOG_FILE, "ab")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    log_handle = open(LOG_FILE, "wb" if quick else "ab")
     try:
         proc = subprocess.Popen(args, stdout=log_handle, stderr=log_handle, stdin=subprocess.DEVNULL,
                                 start_new_session=True, env={**os.environ, **env})
@@ -275,16 +288,51 @@ def enable(state):
     log_handle.close()
     PID_FILE.write_text(str(proc.pid))
     os.chmod(PID_FILE, 0o600)
-    time.sleep(1.2)
-    if proc.poll() is not None:
-        try:
-            PID_FILE.unlink()
-        except OSError:
-            pass
-        return {"ok": False, "changed": False, "message": "cloudflared 启动后立即退出，请检查配置"}
+    output = []
+    public_url = ""
+    if quick:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                text = LOG_FILE.read_text(errors="ignore")
+            except OSError:
+                text = ""
+            match = re.search(r"https://[A-Za-z0-9.-]+\.trycloudflare\.com", text)
+            if match:
+                public_url = match.group(0)
+                output = command_output("", text)
+                break
+            time.sleep(0.5)
+        if proc.poll() is not None:
+            try:
+                PID_FILE.unlink()
+            except OSError:
+                pass
+            try:
+                text = LOG_FILE.read_text(errors="ignore")
+            except OSError:
+                text = ""
+            output = command_output("", text)
+            return {"ok": False, "changed": False, "message": "cloudflared 启动后立即退出，请检查配置", "output": output}
+    else:
+        time.sleep(1.2)
+        if proc.poll() is not None:
+            try:
+                PID_FILE.unlink()
+            except OSError:
+                pass
+            return {"ok": False, "changed": False, "message": "cloudflared 启动后立即退出，请检查配置"}
     state["enabled"] = True
+    if public_url:
+        state["publicUrl"] = public_url
     save_state(state)
-    return {"ok": True, "changed": True, "message": "隧道已启动", "status": status_view(state)}
+    if quick:
+        message = ("Quick Tunnel 已启动：" + public_url) if public_url else "Quick Tunnel 已启动，尚未拿到公网地址"
+    else:
+        message = "隧道已启动"
+    return {"ok": True, "changed": True, "message": message, "output": output, "status": status_view(state)}
 
 
 def disable(state):
@@ -311,6 +359,7 @@ def disable(state):
     except OSError:
         pass
     state["enabled"] = False
+    state["publicUrl"] = ""
     save_state(state)
     return {"ok": True, "changed": bool(pid), "message": "隧道已停止" if pid else "隧道未在运行", "status": status_view(state)}
 
