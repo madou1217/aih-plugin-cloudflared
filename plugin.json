@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "protocolVersion": 1,
   "pluginId": "network.cloudflared",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "engines": {
     "aih": ">=0.0.0"
   },

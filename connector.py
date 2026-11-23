@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 PLUGIN_ID = "network.cloudflared"
-PLUGIN_VERSION = "0.1.4"
+PLUGIN_VERSION = "0.1.5"
 STATE_DIR = Path(os.environ.get("AIH_PLUGIN_STATE_DIR", Path.home() / ".ai_home" / "plugin-state" / PLUGIN_ID))
 STATE_FILE = STATE_DIR / "state.json"
 PID_FILE = STATE_DIR / "cloudflared.pid"
@@ -250,6 +250,56 @@ def uninstall(state):
     return {"ok": True, "changed": True, "message": "cloudflared 已卸载", "output": output, "status": status_view(state)}
 
 
+HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251})$")
+
+
+def named_config(state, credentials):
+    """把 credentials JSON + hostname/serviceUrl 生成 cloudflared config.yml。
+
+    `credentialsFile` 指向 credentials JSON（AccountTag/TunnelID/TunnelSecret）时，
+    cloudflared 需要的是带 ingress 的 config.yml，而不是该 JSON 本身。也接受已经
+    是 config.yml 的路径（含 `tunnel:` 字段），保持向后兼容。
+    """
+    config = state.get("config") or {}
+    path = Path(credentials).expanduser()
+    try:
+        raw = path.read_text()
+    except OSError as exc:
+        return None, f"读取 credentialsFile 失败：{exc}"
+    try:
+        creds = json.loads(raw)
+    except ValueError:
+        creds = None
+    if isinstance(creds, dict):
+        tunnel_id = str(creds.get("TunnelID") or "").strip()
+        if not tunnel_id:
+            return None, "credentials JSON 缺少 TunnelID"
+        hostname = str(config.get("hostname") or "").strip()
+        if not hostname or not HOSTNAME_RE.match(hostname):
+            return None, "具名隧道需要有效的 hostname"
+        service = str(config.get("serviceUrl") or "http://127.0.0.1:9527").strip()
+        if not (service.startswith("http://") or service.startswith("https://")):
+            return None, "具名隧道需要有效的 serviceUrl"
+        body = (
+            f"tunnel: {tunnel_id}\n"
+            f"credentials-file: {path.resolve()}\n"
+            "no-autoupdate: true\n"
+            "ingress:\n"
+            f"  - hostname: {hostname}\n"
+            f"    service: {service}\n"
+            "  - service: http_status:404\n"
+        )
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(STATE_DIR, 0o700)
+        generated = STATE_DIR / "config.yml"
+        generated.write_text(body)
+        os.chmod(generated, 0o600)
+        return generated, ""
+    if re.search(r"(?m)^\s*tunnel\s*:", raw):
+        return path, ""
+    return None, "credentialsFile 既不是 credentials JSON，也不是 cloudflared config.yml"
+
+
 def enable(state):
     binary = binary_path()
     if not binary:
@@ -275,7 +325,11 @@ def enable(state):
     if token:
         env["TUNNEL_TOKEN"] = token
     elif credentials and not quick:
-        args += ["--config", credentials]
+        config_path, config_error = named_config(state, credentials)
+        if config_path is None:
+            return {"ok": False, "changed": False, "message": config_error, "status": status_view(state)}
+        # --config 必须位于 run 子命令之前，否则 cloudflared 会把参数当成 run 的未知参数。
+        args = [binary, "tunnel", "--no-autoupdate", "--config", str(config_path), "run"]
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(STATE_DIR, 0o700)
     log_handle = open(LOG_FILE, "wb" if quick else "ab")
@@ -323,7 +377,12 @@ def enable(state):
                 PID_FILE.unlink()
             except OSError:
                 pass
-            return {"ok": False, "changed": False, "message": "cloudflared 启动后立即退出，请检查配置"}
+            try:
+                text = LOG_FILE.read_text(errors="ignore")
+            except OSError:
+                text = ""
+            return {"ok": False, "changed": False, "message": "cloudflared 启动后立即退出，请检查配置",
+                    "output": command_output("", text), "status": status_view(state)}
     state["enabled"] = True
     if public_url:
         state["publicUrl"] = public_url
