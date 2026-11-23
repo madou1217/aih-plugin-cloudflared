@@ -20,21 +20,36 @@ AIH `network.connector` plugin for **Cloudflare Tunnel**.
 
 ## Install
 
+签名是可选的：未签名包默认可以安装；带签名但公钥未登记时会以「签名未验证」状态安装，不会冒充「已验证」。
+
+### 从 Release 安装（推荐）
+
 ```sh
-# Build and install (unsigned during development)
-aih plugin pack . cloudflared-0.1.0.aih-plugin
-aih plugin install ./cloudflared-0.1.0.aih-plugin
+gh release download v0.1.1 -R madou1217/aih-plugin-cloudflared
+shasum -a 256 -c SHA256SUMS
+# 一步：登记公钥并安装；指纹必须与 Release 说明一致
+aih plugin install ./cloudflared-0.1.1.aih-plugin \
+  --trust-key ./public.pem \
+  --expect-fingerprint 3960e945419f8f267c3f47b1
 aih plugin enable network.cloudflared --accept-permissions
 ```
 
-For a distributed build, sign it with an Ed25519 release key:
+不想校验签名时直接 `aih plugin install ./cloudflared-0.1.1.aih-plugin`。
+需要强制策略时加 `--require-signed`：未签名或公钥未登记都会被拒绝。
+
+### 本地开发打包
+
+```sh
+aih plugin pack . cloudflared-0.1.0.aih-plugin
+aih plugin install ./cloudflared-0.1.0.aih-plugin
+```
+
+发布者签名：
 
 ```sh
 aih plugin keygen --out keys
 aih plugin pack . cloudflared-0.1.0.aih-plugin \
   --signing-key keys/private.pem --key-id aih-plugins
-aih plugin trust keys/public.pem --key-id aih-plugins
-aih plugin install ./cloudflared-0.1.0.aih-plugin --require-signed
 ```
 
 Never commit `keys/private.pem`.
