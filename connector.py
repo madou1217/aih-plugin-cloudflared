@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 PLUGIN_ID = "network.cloudflared"
-PLUGIN_VERSION = "0.1.1"
+PLUGIN_VERSION = "0.1.3"
 STATE_DIR = Path(os.environ.get("AIH_PLUGIN_STATE_DIR", Path.home() / ".ai_home" / "plugin-state" / PLUGIN_ID))
 STATE_FILE = STATE_DIR / "state.json"
 PID_FILE = STATE_DIR / "cloudflared.pid"
@@ -50,6 +50,28 @@ def save_state(state):
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
     os.chmod(tmp, 0o600)
     tmp.replace(STATE_FILE)
+
+
+def proxy_env(state):
+    proxy = str((state.get("config") or {}).get("proxyUrl") or "").strip()
+    if not proxy:
+        return {}
+    return {
+        "HTTPS_PROXY": proxy,
+        "HTTP_PROXY": proxy,
+        "ALL_PROXY": proxy,
+        "https_proxy": proxy,
+        "http_proxy": proxy,
+        "all_proxy": proxy,
+    }
+
+
+def command_output(out, err, limit=20):
+    text = (err or out or "").strip()
+    if not text:
+        return []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-limit:]
 
 
 def binary_path():
@@ -151,7 +173,7 @@ def describe():
             "operations": [
                 {"id": "install", "label": "安装 cloudflared", "confirmation": "required"},
                 {"id": "uninstall", "label": "卸载 cloudflared", "confirmation": "required"},
-                {"id": "configure", "label": "配置 Tunnel", "inputKind": "secret", "confirmation": "required"},
+                {"id": "configure", "label": "配置 Tunnel / 代理", "inputKind": "secret", "confirmation": "required"},
                 {"id": "enable", "label": "启用隧道", "confirmation": "required"},
                 {"id": "disable", "label": "停用隧道", "confirmation": "required"},
                 {"id": "probe", "label": "探测隧道状态", "confirmation": "none"},
@@ -164,9 +186,10 @@ def describe():
                         "credentialsFile": {"type": "string", "description": "credentials JSON 路径"},
                         "hostname": {"type": "string"},
                         "serviceUrl": {"type": "string"},
+                        "proxyUrl": {"type": "string", "description": "安装/连接使用的 HTTP(S) 或 SOCKS 代理"},
                     },
                 },
-                "secretFields": ["tunnelToken"],
+                "secretFields": ["tunnelToken", "proxyUrl"],
             },
             "connectivityModes": ["outbound-tunnel", "unavailable"],
         },
@@ -178,7 +201,7 @@ def configure(state, value):
     if isinstance(value, dict):
         if isinstance(value.get("value"), str):
             config["tunnelToken"] = value["value"].strip()
-        for key in ("tunnelToken", "credentialsFile", "hostname", "serviceUrl"):
+        for key in ("tunnelToken", "credentialsFile", "hostname", "serviceUrl", "proxyUrl"):
             if isinstance(value.get(key), str):
                 config[key] = value[key].strip()
     elif isinstance(value, str):
@@ -197,11 +220,13 @@ def install(state):
     brew = shutil.which("brew")
     if not brew:
         return {"ok": False, "changed": False, "message": "未找到 Homebrew；请手动安装 cloudflared 后重试"}
-    code, out, err = run([brew, "install", "cloudflared"], timeout=600)
+    code, out, err = run([brew, "install", "cloudflared"], timeout=600, env=proxy_env(state))
+    output = command_output(out, err)
     if code != 0:
         log(err or out)
-        return {"ok": False, "changed": False, "message": "Homebrew 安装失败，详见服务日志"}
-    return {"ok": True, "changed": True, "message": "cloudflared 安装完成", "status": status_view(state)}
+        reason = output[-1] if output else "Homebrew 安装失败"
+        return {"ok": False, "changed": False, "message": "Homebrew 安装失败：" + reason[:200], "output": output}
+    return {"ok": True, "changed": True, "message": "cloudflared 安装完成", "output": output, "status": status_view(state)}
 
 
 def uninstall(state):
@@ -211,11 +236,13 @@ def uninstall(state):
     brew = shutil.which("brew")
     if not brew:
         return {"ok": False, "changed": False, "message": "未找到 Homebrew；请手动卸载 cloudflared"}
-    code, out, err = run([brew, "uninstall", "cloudflared"], timeout=300)
+    code, out, err = run([brew, "uninstall", "cloudflared"], timeout=300, env=proxy_env(state))
+    output = command_output(out, err)
     if code != 0:
         log(err or out)
-        return {"ok": False, "changed": False, "message": "Homebrew 卸载失败，详见服务日志"}
-    return {"ok": True, "changed": True, "message": "cloudflared 已卸载", "status": status_view(state)}
+        reason = output[-1] if output else "Homebrew 卸载失败"
+        return {"ok": False, "changed": False, "message": "Homebrew 卸载失败：" + reason[:200], "output": output}
+    return {"ok": True, "changed": True, "message": "cloudflared 已卸载", "output": output, "status": status_view(state)}
 
 
 def enable(state):
@@ -233,7 +260,7 @@ def enable(state):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(STATE_DIR, 0o700)
     args = [binary_path(), "tunnel", "--no-autoupdate", "run"]
-    env = {}
+    env = proxy_env(state)
     if token:
         env["TUNNEL_TOKEN"] = token
     elif credentials:
